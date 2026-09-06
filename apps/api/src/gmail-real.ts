@@ -1,0 +1,10 @@
+import {google,gmail_v1} from 'googleapis';
+export function oauthClient(){return new google.auth.OAuth2(process.env.GOOGLE_CLIENT_ID,process.env.GOOGLE_CLIENT_SECRET,process.env.GOOGLE_REDIRECT_URI);}
+export function authUrl(state:string){return oauthClient().generateAuthUrl({access_type:'offline',prompt:'consent',state,scope:['https://www.googleapis.com/auth/gmail.modify']});}
+export async function exchangeCode(code:string){const client=oauthClient();const {tokens}=await client.getToken(code);return tokens;}
+export class GmailAdapter {private api:gmail_v1.Gmail;constructor(tokens:any){const client=oauthClient();client.setCredentials(tokens);this.api=google.gmail({version:'v1',auth:client});}
+ async listMessages(max=50){const list=await this.api.users.messages.list({userId:'me',labelIds:['INBOX'],maxResults:max});const out=[];for(const item of list.data.messages||[]){if(!item.id)continue;const full=await this.api.users.messages.get({userId:'me',id:item.id,format:'metadata',metadataHeaders:['From','Subject','Date','List-Unsubscribe']});const headers=Object.fromEntries((full.data.payload?.headers||[]).map(h=>[h.name?.toLowerCase()||'',h.value||'']));out.push({id:item.id,threadId:full.data.threadId||item.threadId||item.id,sender:headers.from||'unknown',subject:headers.subject||'(no subject)',snippet:full.data.snippet||'',receivedAt:headers.date||new Date().toISOString(),labels:full.data.labelIds||[],unsubscribe:headers['list-unsubscribe']||null});}return out;}
+ async archive(id:string){await this.api.users.messages.modify({userId:'me',id,requestBody:{removeLabelIds:['INBOX']}});return {id};}
+ async undoArchive(id:string){await this.api.users.messages.modify({userId:'me',id,requestBody:{addLabelIds:['INBOX']}});return {id};}
+ async createDraft(id:string,body:string){const raw=Buffer.from(`Content-Type: text/plain; charset=UTF-8\r\n\r\n${body}`).toString('base64url');const r=await this.api.users.drafts.create({userId:'me',requestBody:{message:{threadId:id,raw}}});return {gmailDraftId:r.data.id,messageId:id};}
+}

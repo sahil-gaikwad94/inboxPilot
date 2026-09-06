@@ -24,6 +24,7 @@ type Decision = {
   undoAvailable: boolean;
   draft?: { status: string; body: string };
   correction?: any;
+  intelligence?: { summary?: string; intent?: string; urgency?: string; deadline?: string | null; evidence?: string[]; promptInjectionRisk?: string; actionConfidence?: number; reasoningMode?: string };
   state: string;
   createdAt: string;
 };
@@ -61,8 +62,9 @@ function App() {
 
   const load = async () => {
     const r = await apiFetch(`${API}/decisions`);
+    if (!r.ok) throw new Error(`Decision load failed (${r.status})`);
     const j = await r.json();
-    setDecisions(j.decisions);
+    setDecisions(j.decisions || []);
   };
 
   const loadSession = async () => {
@@ -75,7 +77,7 @@ function App() {
   };
 
   useEffect(() => {
-    load();
+    load().catch(() => notify('Inbox data is temporarily unavailable.'));
     loadSession();
 
     const params = new URLSearchParams(window.location.search);
@@ -92,10 +94,16 @@ function App() {
 
   const sync = async () => {
     setLoading(true);
-    await apiFetch(`${API}/sync`, { method: 'POST' });
-    await load();
-    setLoading(false);
-    notify('Inbox analyzed under the current policy.');
+    try {
+      const response = await apiFetch(`${API}/sync`, { method: 'POST' });
+      if (!response.ok) throw new Error(`Sync failed (${response.status})`);
+      await load();
+      notify('Inbox analyzed with intent, urgency, and safety reasoning.');
+    } catch {
+      notify('Analysis failed. Check the API service logs.');
+    } finally {
+      setLoading(false);
+    }
   };
 
   const undo = async (id: string) => {
@@ -136,7 +144,7 @@ function App() {
     settings: 'Autonomy settings',
   };
 
-  const showConnect = session && (session.demoMode || !session.connected);
+  const showConnect = !session || session.demoMode || !session.connected;
 
   return (
     <div className="app">
@@ -187,7 +195,7 @@ function App() {
             {session && (
               <span className={`status-pill ${session.demoMode ? 'demo' : 'live'}`}>
                 <Radio size={12} />
-                {session.demoMode ? 'Demo mode · mock inbox' : 'Gmail connected'}
+                {session.demoMode ? 'Demo mode · mock inbox' : session.connected ? 'Gmail connected' : 'Gmail not connected'}
               </span>
             )}
             <h1>{titles[tab]}</h1>
@@ -320,6 +328,23 @@ function EmailRow({
 
         <h3>{d.email.subject}</h3>
         <p>{d.email.snippet}</p>
+
+        {d.intelligence && (
+          <div className="intelligence glass">
+            <b>Agent reasoning</b>
+            <p>{d.intelligence.summary}</p>
+            <div className="intelligence-meta">
+              <span>Intent: {d.intelligence.intent || 'unknown'}</span>
+              <span>Urgency: {d.intelligence.urgency || 'normal'}</span>
+              <span>Action confidence: {Math.round((d.intelligence.actionConfidence || 0) * 100)}%</span>
+              {d.intelligence.deadline && <span>Deadline: {d.intelligence.deadline}</span>}
+            </div>
+            {d.intelligence.promptInjectionRisk && d.intelligence.promptInjectionRisk !== 'low' && (
+              <p className="warning"><b>Safety warning:</b> suspicious instruction language detected; this message requires review.</p>
+            )}
+            {!!d.intelligence.evidence?.length && <small>{d.intelligence.evidence[0]}</small>}
+          </div>
+        )}
 
         <div className="decision">
           <span className="decision-icon">

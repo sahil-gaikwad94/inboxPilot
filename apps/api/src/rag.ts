@@ -88,3 +88,4 @@ export async function askInbox(question: string, emails: RagEmail[], limit = 6) 
   const response = await generateGroundedAnswer(question, results);
   return { ...response, retrieved: results.map(({ score, matchedTerms, ...email }) => ({ ...email, score: Number(score.toFixed(4)), matchedTerms })) };
 }
+

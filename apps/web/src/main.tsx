@@ -9,9 +9,9 @@ import {
   Undo2,
   CheckCircle2,
   AlertTriangle,
-  SlidersHorizontal,
   Radio,
   Sparkles,
+  Mail,
 } from 'lucide-react';
 import './styles.css';
 
@@ -54,6 +54,11 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [toast, setToast] = useState('');
 
+  const notify = (message: string, ms = 3000) => {
+    setToast(message);
+    setTimeout(() => setToast(''), ms);
+  };
+
   const load = async () => {
     const r = await apiFetch(`${API}/decisions`);
     const j = await r.json();
@@ -72,11 +77,17 @@ function App() {
   useEffect(() => {
     load();
     loadSession();
+
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('gmail') === 'connected') {
+      notify('Gmail connected.');
+      window.history.replaceState({}, '', window.location.pathname);
+      loadSession();
+    }
   }, []);
 
-  const notify = (message: string, ms = 3000) => {
-    setToast(message);
-    setTimeout(() => setToast(''), ms);
+  const connectGmail = () => {
+    window.location.href = `${API}/gmail/connect`;
   };
 
   const sync = async () => {
@@ -124,6 +135,8 @@ function App() {
     activity: 'Agent activity',
     settings: 'Autonomy settings',
   };
+
+  const showConnect = session && (session.demoMode || !session.connected);
 
   return (
     <div className="app">
@@ -179,10 +192,19 @@ function App() {
             )}
             <h1>{titles[tab]}</h1>
           </div>
-          <button className="primary" onClick={sync} disabled={loading}>
-            <Sparkles size={16} />
-            {loading ? 'Analyzing…' : 'Analyze inbox'}
-          </button>
+
+          <div className="header-actions">
+            {showConnect && (
+              <button className="secondary" onClick={connectGmail}>
+                <Mail size={16} />
+                Connect Gmail
+              </button>
+            )}
+            <button className="primary" onClick={sync} disabled={loading}>
+              <Sparkles size={16} />
+              {loading ? 'Analyzing…' : 'Analyze inbox'}
+            </button>
+          </div>
         </header>
 
         {toast && (
@@ -434,8 +456,8 @@ function SettingsView({
         <div className="warning">
           <ShieldCheck size={18} />
           <span>
-            <b>High-stakes override enabled.</b> Security, financial, legal, medical, employment,
-            and password messages are never auto-archived.
+            <b>High-stakes override enabled.</b> Security, financial, legal, employment,
+            medical, and password messages are never auto-archived.
           </span>
         </div>
 

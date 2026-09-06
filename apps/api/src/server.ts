@@ -8,6 +8,7 @@ import { MockGmailAdapter } from './gmail.js';
 import { GmailAdapter, authUrl, exchangeCode } from './gmail-real.js';
 import { connectDb, isDbConnected, User, Decision } from './db.js';
 import { analyzeEmail } from './intelligence.js';
+import { askInbox, retrieveEmails } from './rag.js';
 
 const app = express();
 const port = Number(process.env.PORT || process.env.API_PORT || 4000);
@@ -148,6 +149,11 @@ function adapterFor(tokens?: any) {
   return tokens && !demoMode ? new GmailAdapter(tokens) : gmailMock;
 }
 
+async function getInboxCorpus(userId: string) {
+  if (isDbConnected()) return Decision.find({ userId }).sort({ createdAt: -1 }).limit(200).lean();
+  return [...memory.values()].filter((item) => item.userId === userId).sort((a, b) => +new Date(b.createdAt) - +new Date(a.createdAt)).slice(0, 200);
+}
+
 app.get('/api/health', (_req, res) =>
   res.json({
     status: 'ok',
@@ -155,7 +161,9 @@ app.get('/api/health', (_req, res) =>
     demoMode,
     dbConnected: isDbConnected(),
     mlConfigured: Boolean(process.env.ML_SERVICE_URL),
-    aiConfigured: Boolean(process.env.OPENAI_API_KEY),
+    aiConfigured: Boolean(process.env.GEMINI_API_KEY),
+    ragConfigured: true,
+    geminiConfigured: Boolean(process.env.GEMINI_API_KEY),
   })
 );
 
@@ -213,6 +221,20 @@ app.post('/api/agent/analyze', async (req, res) => {
   const email = parsed.data;
   const classification = email.classification || { category: 'unknown', confidence: 0.5 };
   return res.json({ analysis: await analyzeEmail(email, classification) });
+});
+
+app.post('/api/rag/search', async (req, res) => {
+  const parsed = z.object({ query: z.string().min(2).max(500), limit: z.number().int().min(1).max(20).optional() }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'Query must be between 2 and 500 characters' });
+  const results = retrieveEmails(parsed.data.query, await getInboxCorpus(getUserId(req)), parsed.data.limit || 8);
+  return res.json({ results });
+});
+
+app.post('/api/rag/ask', async (req, res) => {
+  const parsed = z.object({ question: z.string().min(2).max(1000), limit: z.number().int().min(1).max(12).optional() }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'Question must be between 2 and 1000 characters' });
+  const result = await askInbox(parsed.data.question, await getInboxCorpus(getUserId(req)), parsed.data.limit || 6);
+  return res.json(result);
 });
 
 app.get('/api/gmail/callback', async (req, res) => {
@@ -470,6 +492,10 @@ connectDb()
 
 if (process.env.NODE_ENV !== 'test') {
   app.listen(port, () => console.log(`InboxPilot API listening on ${port}`));
+}
+
+export { app };
+
 }
 
 export { app };

@@ -29,4 +29,3 @@ describe('email RAG', () => {
     expect(result.citations).toHaveLength(0);
   });
 });
-

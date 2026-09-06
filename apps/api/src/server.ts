@@ -7,6 +7,7 @@ import { decide, DEFAULT_SETTINGS, PolicySettings } from './policy.js';
 import { MockGmailAdapter } from './gmail.js';
 import { GmailAdapter, authUrl, exchangeCode } from './gmail-real.js';
 import { connectDb, isDbConnected, User, Decision } from './db.js';
+import { analyzeEmail } from './intelligence.js';
 
 const app = express();
 const port = Number(process.env.PORT || process.env.API_PORT || 4000);
@@ -154,6 +155,7 @@ app.get('/api/health', (_req, res) =>
     demoMode,
     dbConnected: isDbConnected(),
     mlConfigured: Boolean(process.env.ML_SERVICE_URL),
+    aiConfigured: Boolean(process.env.OPENAI_API_KEY),
   })
 );
 
@@ -190,6 +192,27 @@ app.get('/api/gmail/connect', (_req, res) => {
 
   const value = `${Date.now()}:${crypto.randomBytes(12).toString('hex')}`;
   return res.redirect(authUrl(signState(value)));
+});
+
+app.post('/api/agent/analyze', async (req, res) => {
+  const parsed = z
+    .object({
+      sender: z.string().max(500).optional(),
+      subject: z.string().max(500).optional(),
+      snippet: z.string().max(10000).optional(),
+      receivedAt: z.string().optional(),
+      threadId: z.string().optional(),
+      classification: z
+        .object({ category: z.string().optional(), confidence: z.number().optional() })
+        .optional(),
+    })
+    .safeParse(req.body);
+
+  if (!parsed.success) return res.status(400).json({ error: 'Invalid email payload' });
+
+  const email = parsed.data;
+  const classification = email.classification || { category: 'unknown', confidence: 0.5 };
+  return res.json({ analysis: await analyzeEmail(email, classification) });
 });
 
 app.get('/api/gmail/callback', async (req, res) => {
@@ -279,6 +302,7 @@ app.post('/api/sync', async (req, res) => {
 
   for (const email of messages) {
     const classification = await classify(email);
+    const intelligence = await analyzeEmail(email, classification);
     const decision = decide(
       classification.category as any,
       classification.confidence,
@@ -291,6 +315,7 @@ app.post('/api/sync', async (req, res) => {
       userId,
       email,
       classification,
+      intelligence,
       ...decision,
       createdAt: new Date(),
       state: 'applied',
@@ -301,7 +326,7 @@ app.post('/api/sync', async (req, res) => {
     if (decision.action === 'drafted_reply') {
       record.draft = {
         status: 'pending_approval',
-        body: `Hi,\n\nThanks for your message about "${email.subject}". I'll review this and get back to you shortly.\n\nBest,\nInboxPilot`,
+        body: intelligence.draft || `Hi,\n\nThanks for your message about "${email.subject}". I'll review this and get back to you shortly.\n\nBest,\nInboxPilot`,
       };
     }
 

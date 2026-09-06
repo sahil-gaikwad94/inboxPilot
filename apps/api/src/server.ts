@@ -6,9 +6,10 @@ import { z } from 'zod';
 import { decide, DEFAULT_SETTINGS, PolicySettings } from './policy.js';
 import { MockGmailAdapter } from './gmail.js';
 import { GmailAdapter, authUrl, exchangeCode } from './gmail-real.js';
-import { connectDb, isDbConnected, User, Decision } from './db.js';
+import { connectDb, isDbConnected, User, Decision, AgentApproval, Memory, Entity, Application, Briefing } from './db.js';
 import { analyzeEmail } from './intelligence.js';
 import { askInbox, retrieveEmails } from './rag.js';
+import { buildAgentPlan, buildBriefing, executeSafeTool, policyDefaults, routeEmail } from './agents.js';
 
 const app = express();
 const port = Number(process.env.PORT || process.env.API_PORT || 4000);
@@ -18,6 +19,12 @@ const demoMode = !process.env.GOOGLE_CLIENT_ID;
 const gmailMock = new MockGmailAdapter();
 const settings: PolicySettings = { ...DEFAULT_SETTINGS };
 const memory = new Map<string, any>();
+const approvalMemory = new Map<string, any>();
+const memoryLog = new Map<string, any[]>();
+const entityMemory = new Map<string, any[]>();
+const applicationMemory = new Map<string, any[]>();
+const briefingMemory = new Map<string, any[]>();
+const agentPolicy = new Map<string, any>();
 
 const signState = (value: string) =>
   `${value}.${crypto
@@ -154,6 +161,69 @@ async function getInboxCorpus(userId: string) {
   return [...memory.values()].filter((item) => item.userId === userId).sort((a, b) => +new Date(b.createdAt) - +new Date(a.createdAt)).slice(0, 200);
 }
 
+async function saveApproval(userId: string, email: any, toolCall: any, plan: any) {
+  const record = { userId, emailId: email.id, kind: plan.route, status: 'pending', toolCall, preview: { subject: email.subject, sender: email.sender, summary: plan.summary, route: plan.route }, createdAt: new Date(), expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000) };
+  if (isDbConnected()) return AgentApproval.create(record);
+  const approval = { ...record, id: `approval-${crypto.randomUUID()}` };
+  approvalMemory.set(approval.id, approval);
+  return approval;
+}
+
+async function listApprovals(userId: string) {
+  if (isDbConnected()) return AgentApproval.find({ userId }).sort({ createdAt: -1 }).limit(50).lean();
+  return [...approvalMemory.values()].filter((item) => item.userId === userId).sort((a, b) => +new Date(b.createdAt) - +new Date(a.createdAt));
+}
+
+async function saveMemory(userId: string, content: any, type = 'episodic', sourceEmailId?: string) {
+  const record = { userId, type, content, sourceEmailId, weight: 1, createdAt: new Date() };
+  if (isDbConnected()) return Memory.create(record);
+  const items = memoryLog.get(userId) || []; items.unshift({ ...record, id: crypto.randomUUID() }); memoryLog.set(userId, items.slice(0, 500)); return items[0];
+}
+
+async function upsertEntities(userId: string, plan: any) {
+  const updates = Object.entries(plan.entities || {}).flatMap(([type, values]) => (values as string[]).map((name) => ({ type, key: name.toLowerCase(), name })));
+  if (isDbConnected()) {
+    for (const entity of updates) await Entity.findOneAndUpdate({ userId, type: entity.type, key: entity.key }, { $set: { name: entity.name, attributes: {}, updatedAt: new Date() }, $inc: { mentions: 1 } }, { upsert: true });
+    return updates;
+  }
+  const current = entityMemory.get(userId) || [];
+  for (const entity of updates) { const found = current.find((x) => x.type === entity.type && x.key === entity.key); if (found) found.mentions += 1; else current.push({ ...entity, mentions: 1, updatedAt: new Date() }); }
+  entityMemory.set(userId, current.slice(-500)); return current;
+}
+
+async function upsertApplications(userId: string, plan: any, email: any) {
+  const companies = plan.entities?.companies || [];
+  const stage = /offer|selected|hired/i.test(`${email.subject} ${email.snippet}`) ? 'offer' : /interview|screen|assessment/i.test(`${email.subject} ${email.snippet}`) ? 'interview' : /reject|decline|not moving/i.test(`${email.subject} ${email.snippet}`) ? 'closed' : 'applied';
+  const result = companies.map((company: string) => ({ userId, company, stage, status: stage === 'closed' ? 'closed' : 'active', sourceEmailId: email.id, evidence: email.snippet, updatedAt: new Date() }));
+  if (isDbConnected()) { for (const item of result) await Application.findOneAndUpdate({ userId, company: item.company }, item, { upsert: true, new: true }); return result; }
+  const current = applicationMemory.get(userId) || []; for (const item of result) { const found = current.find((x) => x.company === item.company); if (found) Object.assign(found, item); else current.push(item); } applicationMemory.set(userId, current); return current;
+}
+
+async function getApplications(userId: string) { return isDbConnected() ? Application.find({ userId }).sort({ updatedAt: -1 }).lean() : applicationMemory.get(userId) || []; }
+async function getBriefings(userId: string) { return isDbConnected() ? Briefing.find({ userId }).sort({ createdAt: -1 }).limit(10).lean() : briefingMemory.get(userId) || []; }
+
+async function runScheduledTriage(userId: string) {
+  const user = await getDbUser(userId);
+  const gmail: any = adapterFor(user?.googleTokens);
+  const messages = await gmail.listMessages(50);
+  let approvals = 0;
+  for (const email of messages) {
+    const classification = await classify(email);
+    const intelligence = await analyzeEmail(email, classification);
+    const plan = buildAgentPlan({ ...email, classification, intelligence });
+    await upsertEntities(userId, plan);
+    await saveMemory(userId, { subject: email.subject, sender: email.sender, route: plan.route, summary: plan.summary }, 'scheduled_observation', email.id);
+    if (plan.route === 'application_tracker') await upsertApplications(userId, plan, email);
+    for (const tool of plan.toolCalls.filter((item) => item.requiresApproval)) { await saveApproval(userId, email, tool, plan); approvals += 1; }
+    const decision = decide(classification.category as any, classification.confidence, email.subject, email.sender, settings);
+    const record: any = { userId, email, classification, intelligence, agentPlan: plan, ...decision, createdAt: new Date(), state: 'applied' };
+    if (decision.action === 'archived') await gmail.archive(email.id);
+    if (isDbConnected()) await Decision.findOneAndUpdate({ userId, 'email.id': email.id }, record, { upsert: true, new: true });
+    else memory.set(`d-${email.id}`, { ...record, id: `d-${email.id}` });
+  }
+  return { processed: messages.length, approvals };
+}
+
 app.get('/api/health', (_req, res) =>
   res.json({
     status: 'ok',
@@ -235,6 +305,83 @@ app.post('/api/rag/ask', async (req, res) => {
   if (!parsed.success) return res.status(400).json({ error: 'Question must be between 2 and 1000 characters' });
   const result = await askInbox(parsed.data.question, await getInboxCorpus(getUserId(req)), parsed.data.limit || 6);
   return res.json(result);
+});
+
+app.get('/api/agents/approvals', async (req, res) => res.json({ approvals: await listApprovals(getUserId(req)) }));
+
+app.post('/api/agents/approvals/:id/decision', async (req, res) => {
+  const parsed = z.object({ decision: z.enum(['approved', 'rejected']) }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'Decision must be approved or rejected' });
+  const userId = getUserId(req);
+  const approval: any = isDbConnected() ? await AgentApproval.findOne({ _id: req.params.id, userId }) : approvalMemory.get(req.params.id);
+  if (!approval || approval.userId !== userId) return res.status(404).json({ error: 'Approval card not found' });
+  if (approval.status !== 'pending') return res.status(409).json({ error: 'Approval card is already decided' });
+  approval.status = parsed.data.decision; approval.decidedAt = new Date();
+  if (isDbConnected()) await AgentApproval.findByIdAndUpdate(approval._id, { status: approval.status, decidedAt: approval.decidedAt });
+  else approvalMemory.set(req.params.id, approval);
+  const result = parsed.data.decision === 'approved' ? executeSafeTool(approval.toolCall) : { status: 'rejected' };
+  if (parsed.data.decision === 'approved') await saveMemory(userId, { approvalId: String(approval._id || approval.id), tool: approval.toolCall.tool, result }, 'approval_decision');
+  return res.json({ approval, result });
+});
+
+app.get('/api/agents/policy', async (req, res) => {
+  const userId = getUserId(req);
+  if (isDbConnected()) { const user = await getDbUser(userId); return res.json(user?.settings?.agentPolicy || policyDefaults); }
+  return res.json(agentPolicy.get(userId) || policyDefaults);
+});
+
+app.put('/api/agents/policy', async (req, res) => {
+  const parsed = z.object({ autoArchivePromotions: z.boolean(), autoDraftJobFollowups: z.boolean(), neverAutoReplySecurity: z.boolean(), requireApprovalForCalendar: z.boolean(), requireApprovalForApplicationUpdates: z.boolean(), dailyBriefingEnabled: z.boolean() }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'Invalid agent policy' });
+  const userId = getUserId(req); agentPolicy.set(userId, parsed.data);
+  if (isDbConnected() && isMongoId(userId)) await User.findByIdAndUpdate(userId, { $set: { 'settings.agentPolicy': parsed.data } });
+  return res.json(parsed.data);
+});
+
+app.get('/api/agents/applications', async (req, res) => res.json({ applications: await getApplications(getUserId(req)) }));
+app.get('/api/agents/memory', async (req, res) => {
+  const userId = getUserId(req);
+  const memories = isDbConnected() ? await Memory.find({ userId }).sort({ createdAt: -1 }).limit(100).lean() : (memoryLog.get(userId) || []).slice(0, 100);
+  const entities = isDbConnected() ? await Entity.find({ userId }).sort({ updatedAt: -1 }).limit(100).lean() : entityMemory.get(userId) || [];
+  return res.json({ memories, entities });
+});
+
+app.get('/api/agents/briefing', async (req, res) => {
+  const briefings = await getBriefings(getUserId(req));
+  return res.json({ briefing: briefings[0] || null, history: briefings });
+});
+
+app.post('/api/agents/briefing/run', async (req, res) => {
+  const userId = getUserId(req);
+  const decisions: any[] = await getInboxCorpus(userId);
+  const approvals = await listApprovals(userId);
+  const applications = await getApplications(userId);
+  const briefing = buildBriefing(decisions, approvals, applications);
+  if (isDbConnected()) await Briefing.create({ userId, payload: briefing });
+  else { const current = briefingMemory.get(userId) || []; current.unshift({ id: briefing.id, userId, payload: briefing, createdAt: new Date() }); briefingMemory.set(userId, current.slice(0, 10)); }
+  await saveMemory(userId, briefing, 'executive_briefing');
+  return res.json({ briefing });
+});
+
+// Render Cron or an external scheduler can call this route with CRON_SECRET.
+app.post('/api/cron/sync', async (req, res) => {
+  if (!process.env.CRON_SECRET || req.headers.authorization !== `Bearer ${process.env.CRON_SECRET}`) return res.status(401).json({ error: 'Unauthorized' });
+  const userId = String(req.headers['x-user-id'] || demoUser);
+  const triage = await runScheduledTriage(userId);
+  const briefing = buildBriefing(await getInboxCorpus(userId), await listApprovals(userId), await getApplications(userId));
+  if (isDbConnected()) await Briefing.create({ userId, payload: briefing });
+  else { const current = briefingMemory.get(userId) || []; current.unshift({ id: briefing.id, userId, payload: briefing, createdAt: new Date() }); briefingMemory.set(userId, current.slice(0, 10)); }
+  return res.json({ ok: true, triage, briefing });
+});
+
+app.post('/api/cron/briefing', async (req, res) => {
+  if (!process.env.CRON_SECRET || req.headers.authorization !== `Bearer ${process.env.CRON_SECRET}`) return res.status(401).json({ error: 'Unauthorized' });
+  const userId = String(req.headers['x-user-id'] || demoUser);
+  const decisions: any[] = await getInboxCorpus(userId);
+  const briefing = buildBriefing(decisions, await listApprovals(userId), await getApplications(userId));
+  if (isDbConnected()) await Briefing.create({ userId, payload: briefing });
+  else { const current = briefingMemory.get(userId) || []; current.unshift({ id: briefing.id, userId, payload: briefing, createdAt: new Date() }); briefingMemory.set(userId, current.slice(0, 10)); }
+  return res.json({ ok: true, briefing });
 });
 
 app.get('/api/gmail/callback', async (req, res) => {
@@ -325,6 +472,12 @@ app.post('/api/sync', async (req, res) => {
   for (const email of messages) {
     const classification = await classify(email);
     const intelligence = await analyzeEmail(email, classification);
+    const agentPlan = buildAgentPlan({ ...email, classification, intelligence });
+    const toolResults = agentPlan.toolCalls.filter((tool) => !tool.requiresApproval).map((tool) => ({ tool: tool.tool, result: executeSafeTool(tool, email) }));
+    await upsertEntities(userId, agentPlan);
+    await saveMemory(userId, { subject: email.subject, sender: email.sender, route: agentPlan.route, intent: agentPlan.intent, summary: agentPlan.summary }, 'agent_observation', email.id);
+    if (agentPlan.route === 'application_tracker') await upsertApplications(userId, agentPlan, email);
+    for (const tool of agentPlan.toolCalls.filter((item) => item.requiresApproval)) await saveApproval(userId, email, tool, agentPlan);
     const decision = decide(
       classification.category as any,
       classification.confidence,
@@ -338,6 +491,7 @@ app.post('/api/sync', async (req, res) => {
       email,
       classification,
       intelligence,
+      agentPlan: { ...agentPlan, toolResults },
       ...decision,
       createdAt: new Date(),
       state: 'applied',
@@ -495,5 +649,4 @@ if (process.env.NODE_ENV !== 'test') {
 }
 
 export { app };
-
 
